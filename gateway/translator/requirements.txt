@@ -1,0 +1,2 @@
+aiohttp>=3.10,<4
+aws-bedrock-token-generator>=1.1,<2

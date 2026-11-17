@@ -1,0 +1,84 @@
+# Copy to <repo>/crosslab.toml or ~/.config/crosslab/config.toml and edit.
+# Everything here is optional; these are the built-in defaults unless noted.
+
+# gateway = "home"                      # apply a [gateways.<name>] table from the end of this file
+
+base_url = "http://localhost:4000/v1"   # your LiteLLM proxy (OpenAI-compatible /v1)
+
+# The LiteLLM token is chosen by AWS profile. Lookup order:
+#   1. $LITELLM_API_KEY_<PROFILE>   (profile upper-cased, non-alphanumerics -> "_";
+#                                    "dev-gov.1" -> LITELLM_API_KEY_DEV_GOV_1)
+#   2. token_command, with {profile} substituted; stdout is the token
+#   3. $LITELLM_API_KEY
+aws_profile = ""                        # default: $AWS_PROFILE; --aws-profile overrides
+token_command = ""                      # e.g. "cat ~/.litellm/{profile}.token"
+
+# Commands that define "working". Run by the orchestrator in the worktree; all must exit 0.
+checks = []                             # e.g. ["pytest -q", "ruff check .", "mypy src"]
+
+max_fix_rounds = 3                      # driver attempts to turn failing checks green
+review_rounds = 2                       # cross-lab reviews per candidate
+tool_call_budget = 200                  # per agent
+workdir = "~/crosslab-runs"             # worktrees and run artifacts live here
+shell_env_passthrough = []              # secret-looking env vars the driver's shell may keep
+
+# `id` must be the model name as your LiteLLM proxy exposes it (check GET /v1/models).
+[models.terra]
+id = "gpt-5.6-terra"
+# params are passed straight into the chat completions request. Only add what your
+# proxy and translator accept, e.g.:
+# params = { reasoning_effort = "high" }
+# stream = false                        # set if the Mantle translator mishandles streaming
+
+[models.luna]
+id = "gpt-5.6-luna"
+
+[models.grok]
+id = "grok-4.7"
+# aws_profile = "other-profile"         # per-model override if Grok sits behind another profile
+# base_url = "https://other-proxy/v1"   # per-model override
+
+[roles]
+scout = "luna"
+planner = "terra"
+critic = "grok"
+driver = "terra"          # implements in standard mode, and escalation target in cheap mode
+rival = "grok"            # second implementer in duel mode
+cheap_driver = "luna"     # first implementer in cheap mode
+
+[reviewer_for]            # who reviews whose work: always the other lab
+terra = "grok"
+luna = "grok"
+grok = "terra"
+
+# ---------------------------------------------------------------------------------------
+# Gateways: named environments. A [gateways.<name>] table may override ANY key above
+# (base_url, models, roles, checks, ...). Pick one with `gateway = "..."` at the top of
+# this file, --gateway on the command line, or $MASON_GATEWAY.
+
+[gateways.home]                         # the docker-compose stack in gateway/
+base_url = "http://localhost:4000/v1"
+catalog_url = "http://localhost:8090"   # optional: effort validation and cost estimates
+api_key_env = "LITELLM_MASTER_KEY"      # read the token from this variable; skips the AWS-profile lookup
+
+[gateways.home.models.terra]
+effort = "high"                         # sent as reasoning_effort; checked against the catalog
+[gateways.home.models.grok]
+effort = "high"
+[gateways.home.models.opus]             # Anthropic models are available at home
+id = "claude-opus-5-5"
+[gateways.home.roles]
+# driver = "opus"                       # e.g. let Opus drive at home ...
+[gateways.home.reviewer_for]
+opus = "grok"                           # ... reviewed by another lab
+
+[gateways.work]                         # the similar stack at work: only the differences
+base_url = "https://litellm.example.internal/v1"
+# catalog_url = "https://catalog.example.internal"
+# token lookup falls back to LITELLM_API_KEY_<AWS_PROFILE> / token_command, as above
+[gateways.work.models.terra]
+id = "gpt-5.6-terra"                    # whatever names the work proxy exposes
+[gateways.work.models.luna]
+id = "gpt-5.6-luna"
+[gateways.work.models.grok]
+id = "grok-4.7"

@@ -1,0 +1,54 @@
+# Home gateway: LiteLLM in front of Amazon Bedrock, a translator for Bedrock Mantle,
+# and a model catalog.   Usage:  cp .env.example .env  &&  docker compose up -d --build
+name: mason-gateway
+
+x-aws: &aws
+  AWS_PROFILE: ${AWS_PROFILE:-default}
+  AWS_REGION: ${AWS_REGION:-us-east-1}
+  AWS_DEFAULT_REGION: ${AWS_REGION:-us-east-1}
+
+# Read-only is enough for static keys and for SSO sessions you refresh on the host with
+# `aws sso login`. Drop `:ro` if you want the containers to refresh SSO tokens themselves.
+x-aws-mount: &aws-mount ${HOME}/.aws:/root/.aws:ro
+
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable     # pin a version tag once it works for you
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    environment:
+      <<: *aws
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set LITELLM_MASTER_KEY in .env}
+      TRANSLATOR_URL: http://mantle-translator:8080/v1
+      TRANSLATOR_API_KEY: ${TRANSLATOR_API_KEY:?set TRANSLATOR_API_KEY in .env}
+    volumes:
+      - ./litellm/config.yaml:/app/config.yaml:ro
+      - *aws-mount
+    ports:
+      - "127.0.0.1:${GATEWAY_PORT:-4000}:4000"      # localhost only
+    depends_on: [mantle-translator]
+    restart: unless-stopped
+
+  mantle-translator:
+    build: ./translator
+    environment:
+      <<: *aws
+      MANTLE_REGION: ${MANTLE_REGION:-us-east-1}
+      MANTLE_API_KEY: ${MANTLE_API_KEY:-}
+      TRANSLATOR_API_KEY: ${TRANSLATOR_API_KEY:?set TRANSLATOR_API_KEY in .env}
+      UPSTREAM_API: ${UPSTREAM_API:-responses}
+      CARRY_REASONING: ${CARRY_REASONING:-1}
+    volumes:
+      - *aws-mount
+    expose: ["8080"]                                # reachable only from the gateway network
+    restart: unless-stopped
+
+  catalog:
+    build: ./catalog
+    environment:
+      GATEWAY_URL: http://litellm:4000
+      GATEWAY_KEY: ${LITELLM_MASTER_KEY}
+    volumes:
+      - ./catalog/models.toml:/data/models.toml:ro  # edit on the host, no rebuild needed
+    ports:
+      - "127.0.0.1:${CATALOG_PORT:-8090}:8090"
+    restart: unless-stopped
