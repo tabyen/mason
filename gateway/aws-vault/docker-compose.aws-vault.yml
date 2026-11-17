@@ -1,0 +1,13 @@
+# Override for hosts where AWS credentials live in aws-vault (macOS keychain + MFA).
+# The base file mounts ~/.aws and selects AWS_PROFILE, but a profile that gets its
+# credentials from aws-vault cannot work inside a container: aws-vault and the keychain
+# are on the host. This passes the temporary credentials that `aws-vault exec` puts in
+# the environment straight through instead. Use ./up.sh, which wraps the whole thing.
+services:
+  litellm:
+    environment: &vault-creds
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID:?run through aws-vault exec, see aws-vault/up.sh}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:?run through aws-vault exec, see aws-vault/up.sh}
+      AWS_SESSION_TOKEN: ${AWS_SESSION_TOKEN:?run through aws-vault exec, see aws-vault/up.sh}
+  mantle-translator:
+    environment: *vault-creds
