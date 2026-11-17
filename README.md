@@ -33,6 +33,18 @@ The result is a branch `crosslab/<run>-<model>` in a separate worktree; your wor
 is never touched. The exit code is 0 only if checks pass and no blocking review issue
 remains. Plans, critiques, check logs and reviews are kept under `~/crosslab-runs/<repo>/<run>/`.
 
+## Gateways
+
+mason talks to any OpenAI-compatible endpoint. `gateway/` holds a docker-compose stack for
+home use (LiteLLM, a Bedrock Mantle translator and a model catalog); see `gateway/README.md`.
+Named `[gateways.*]` tables in the config switch between that stack and a similar one at work:
+
+    crosslab.py "..." --gateway home --check "pytest -q"
+    MASON_GATEWAY=work crosslab.py "..." --check "pytest -q"
+
+With a `catalog_url`, mason rejects unsupported effort levels before spending tokens and
+prints an estimated cost per model in the report.
+
 ## Things to know
 
 - Agents work from HEAD. Uncommitted changes are invisible to them.

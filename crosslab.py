@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """crosslab: orchestrate GPT-5.6 Terra, GPT-5.6 Luna and Grok 4.7 through a LiteLLM proxy.
 
+The gateway is pluggable: any OpenAI-compatible endpoint works, and named [gateways.*] tables
+in the config switch between environments (for example the home stack in gateway/ and a
+similar one at work) without touching anything else.
+
 Pipeline (each stage is a fresh Strands agent unless noted):
 
   1. scout     Luna x3 in parallel, read-only   -> context brief
@@ -30,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,7 +49,11 @@ from strands.models.openai import OpenAIModel
 # --------------------------------------------------------------------------- config
 
 DEFAULTS = {
+    "gateway": "",                           # name of a [gateways.<name>] table to apply; --gateway / $MASON_GATEWAY override
+    "gateways": {},                          # per-environment overrides of ANY key in this file (home, work, ...)
     "base_url": "http://localhost:4000/v1",  # LiteLLM proxy, OpenAI-compatible
+    "catalog_url": "",                       # optional model catalog (mason.catalog/v1): effort checks and cost estimates
+    "api_key_env": "",                       # env var holding the gateway token; if set, skips the per-profile lookup
     "aws_profile": "",                       # default: $AWS_PROFILE
     "token_command": "",                     # e.g. "my-token-helper --profile {profile}"
     "checks": [],                            # e.g. ["pytest -q", "ruff check ."]
@@ -91,8 +100,54 @@ def load_config(explicit: str | None, repo: Path) -> dict:
     return dict(DEFAULTS)
 
 
+def apply_gateway(cfg: dict, name: str | None) -> dict:
+    """Overlay one [gateways.<name>] table on the config, so the same repo config works at home and at work."""
+    name = name or os.environ.get("MASON_GATEWAY") or cfg.get("gateway")
+    if not name:
+        return cfg
+    if name not in cfg["gateways"]:
+        sys.exit(f"unknown gateway {name!r}; configured: {', '.join(cfg['gateways']) or '(none)'}")
+    log(f"gateway: {name}")
+    return {**merge(cfg, cfg["gateways"][name]), "gateway": name}
+
+
+def fetch_catalog(cfg: dict) -> dict[str, dict]:
+    """Model id -> catalog entry. Empty if no catalog is configured or it cannot be reached."""
+    if not cfg.get("catalog_url"):
+        return {}
+    url = cfg["catalog_url"].rstrip("/")
+    url = url if url.endswith("/catalog") else url + "/v1/catalog"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            return {m["id"]: m for m in json.load(r).get("models", []) if isinstance(m, dict) and "id" in m}
+    except Exception as e:
+        log(f"WARNING: catalog at {url} unavailable ({e}); continuing without effort checks or cost estimates")
+        return {}
+
+
+def preflight(cfg: dict, catalog: dict[str, dict]) -> None:
+    """Fail early on an effort level the model does not take; warn about models the gateway lacks."""
+    for key, m in cfg["models"].items():
+        entry = catalog.get(m["id"])
+        if catalog and entry is None:
+            log(f"WARNING: model {key} ({m['id']}) is not in the catalog")
+            continue
+        if not entry:
+            continue
+        if entry.get("available") is False:
+            log(f"WARNING: the gateway does not currently list {m['id']} (model {key})")
+        levels = (entry.get("effort") or {}).get("levels") or []
+        if m.get("effort") and levels and m["effort"] not in levels:
+            sys.exit(f"model {key} ({m['id']}): effort {m['effort']!r} is not supported; choose from {', '.join(levels)}")
+
+
 def token_for(profile: str, cfg: dict) -> str:
-    """LiteLLM token for an AWS profile: per-profile env var, then helper command, then generic env var."""
+    """Gateway token: `api_key_env` if configured, else by AWS profile (per-profile env var,
+    then helper command), else $LITELLM_API_KEY."""
+    if cfg.get("api_key_env"):
+        if os.environ.get(cfg["api_key_env"]):
+            return os.environ[cfg["api_key_env"]]
+        sys.exit(f"api_key_env is set to {cfg['api_key_env']} but that variable is empty.")
     if profile:
         env_name = "LITELLM_API_KEY_" + re.sub(r"[^A-Za-z0-9]", "_", profile).upper()
         if os.environ.get(env_name):
@@ -364,6 +419,8 @@ class Orchestrator:
         self.usage: dict[str, dict[str, int]] = {}
         self._lock = threading.Lock()
         self._tokens: dict[str, str] = {}
+        self.catalog = fetch_catalog(cfg)
+        preflight(cfg, self.catalog)
 
     # ---- model plumbing
 
@@ -374,10 +431,13 @@ class Orchestrator:
             if profile not in self._tokens:
                 self._tokens[profile] = token_for(profile, self.cfg)
         extra = {"stream": m["stream"]} if "stream" in m else {}
+        params = dict(m.get("params") or {})
+        if m.get("effort"):
+            params["reasoning_effort"] = m["effort"]
         return OpenAIModel(
             client_args={"api_key": self._tokens[profile], "base_url": m.get("base_url") or self.cfg["base_url"],
                          "timeout": self.cfg["request_timeout_s"], "max_retries": 4},
-            model_id=m["id"], params=m.get("params") or None, **extra)
+            model_id=m["id"], params=params or None, **extra)
 
     def agent(self, key: str, system: str, root: Path, write: bool = False) -> Agent:
         agent = Agent(model=self.model(key), system_prompt=system, callback_handler=None,
@@ -389,14 +449,24 @@ class Orchestrator:
         result = agent(prompt)
         used = result.metrics.accumulated_usage or {}
         with self._lock:
-            u = self.usage.setdefault(agent._crosslab_model, {"in": 0, "out": 0})
+            u = self.usage.setdefault(agent._crosslab_model, {"in": 0, "out": 0, "cached": 0})
             # accumulated_usage is cumulative per agent; record the delta
-            prev = getattr(agent, "_crosslab_seen", {"in": 0, "out": 0})
-            now = {"in": used.get("inputTokens", 0), "out": used.get("outputTokens", 0)}
-            u["in"] += now["in"] - prev["in"]
-            u["out"] += now["out"] - prev["out"]
+            prev = getattr(agent, "_crosslab_seen", {"in": 0, "out": 0, "cached": 0})
+            now = {"in": used.get("inputTokens", 0), "out": used.get("outputTokens", 0),
+                   "cached": used.get("cacheReadInputTokens", 0) or 0}
+            for k in now:
+                u[k] += now[k] - prev[k]
             agent._crosslab_seen = now
         return str(result).strip()
+
+    def cost(self, key: str, u: dict) -> float | None:
+        """Estimated USD for one model's usage, from the catalog's per-1M-token prices."""
+        p = (self.catalog.get(self.cfg["models"][key]["id"]) or {}).get("pricing") or {}
+        if p.get("input") is None or p.get("output") is None:
+            return None
+        cached = min(u.get("cached", 0), u["in"])
+        return ((u["in"] - cached) * p["input"] + cached * p.get("cache_read", p["input"])
+                + u["out"] * p["output"]) / 1e6
 
     def save(self, name: str, text: str) -> None:
         (self.run_dir / name).write_text(text)
@@ -596,8 +666,14 @@ class Orchestrator:
             lines += ["", "Candidates:"] + [
                 f"  {c.model:6} checks={'pass' if c.checks_ok else 'fail'} blocking={len(c.blocking)} "
                 f"branch={c.branch}" + (f" error={c.error}" if c.error else "") for c in cands]
-        lines += ["", "Driver's summary:", w.summary or "(none)", "", "Tokens (input / output):"]
-        lines += [f"  {k:6} {u['in']:>10,} / {u['out']:>9,}" for k, u in sorted(self.usage.items())]
+        lines += ["", "Driver's summary:", w.summary or "(none)", "", "Tokens (input / output) and estimated cost:"]
+        total = 0.0
+        for k, u in sorted(self.usage.items()):
+            cost = self.cost(k, u)
+            total += cost or 0.0
+            lines.append(f"  {k:6} {u['in']:>10,} / {u['out']:>9,}" + (f"   ${cost:,.4f}" if cost is not None else ""))
+        if self.catalog:
+            lines.append(f"  total estimate: ${total:,.4f}  (catalog list prices; long-context surcharges not applied)")
         lines += ["", "Next:", f"  git diff {self.base[:10]}..{w.branch}",
                   f"  git merge --squash {w.branch}    # when you are satisfied",
                   f"  git worktree remove --force {w.root}    # clean up", "=" * 72]
@@ -627,6 +703,7 @@ def main() -> int:
     ap.add_argument("--check", action="append", default=[], metavar="CMD",
                     help="check command; repeatable; overrides `checks` in the config")
     ap.add_argument("--config", help="path to a crosslab.toml")
+    ap.add_argument("--gateway", help="name of a [gateways.<name>] table in the config (default: $MASON_GATEWAY or `gateway`)")
     ap.add_argument("--aws-profile", help="AWS profile whose LiteLLM token to use (default: $AWS_PROFILE)")
     ap.add_argument("--no-scout", action="store_true", help="skip the scouting stage")
     ap.add_argument("--no-plan", action="store_true", help="skip plan and critique (small, obvious tasks)")
@@ -650,7 +727,7 @@ def main() -> int:
     if not task.strip():
         sys.exit("empty task")
 
-    cfg = load_config(a.config, repo)
+    cfg = apply_gateway(load_config(a.config, repo), a.gateway)
     if a.check:
         cfg["checks"] = a.check
     if a.aws_profile:

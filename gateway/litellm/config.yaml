@@ -1,0 +1,43 @@
+# LiteLLM gateway config. model_name is what clients send; keep these in step with
+# catalog/models.toml (the catalog flags any mismatch as available: false).
+#
+# Clients can use any of three wire formats against any model here:
+#   /v1/chat/completions (Strands, mason)   /v1/responses (Codex)   /v1/messages (Claude Code)
+
+model_list:
+  # ---- OpenAI on Bedrock Mantle, through the translator container
+  - model_name: gpt-5.6-sol
+    litellm_params: &mantle
+      model: openai/openai.gpt-5.6-sol
+      api_base: os.environ/TRANSLATOR_URL
+      api_key: os.environ/TRANSLATOR_API_KEY
+      allowed_openai_params: ["reasoning_effort"]
+    model_info: { base_model: bedrock_mantle/openai.gpt-5.6-sol }
+  - model_name: gpt-5.6-terra
+    litellm_params: { <<: *mantle, model: openai/openai.gpt-5.6-terra }
+    model_info: { base_model: bedrock_mantle/openai.gpt-5.6-terra }
+  - model_name: gpt-5.6-luna
+    litellm_params: { <<: *mantle, model: openai/openai.gpt-5.6-luna }
+    model_info: { base_model: bedrock_mantle/openai.gpt-5.6-luna }
+
+  # ---- xAI on Bedrock Runtime (AWS credentials come from the mounted ~/.aws and AWS_PROFILE)
+  - model_name: grok-4.7
+    litellm_params:
+      model: bedrock/global.xai.grok-4.7
+      aws_region_name: os.environ/AWS_REGION
+
+  # ---- Anthropic on Bedrock Runtime
+  - model_name: claude-opus-5-5
+    litellm_params: { model: bedrock/global.anthropic.claude-opus-5-5, aws_region_name: os.environ/AWS_REGION }
+  - model_name: claude-sonnet-5-5
+    litellm_params: { model: bedrock/global.anthropic.claude-sonnet-5-5, aws_region_name: os.environ/AWS_REGION }
+  - model_name: claude-haiku-5-5
+    litellm_params: { model: bedrock/global.anthropic.claude-haiku-5-5, aws_region_name: os.environ/AWS_REGION }
+
+litellm_settings:
+  drop_params: true          # ignore parameters a given model does not take instead of failing
+  request_timeout: 900
+  num_retries: 2
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
